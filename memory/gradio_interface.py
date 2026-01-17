@@ -27,7 +27,7 @@ def get_formatted_memories(user_id: str) -> str:
         return f"读取记忆出错: {str(e)}"
 
 # --- 真正的流式聊天函数 ---
-def chat_stream_real(user_id: str, user_input: str, history: List[Dict[str, str]]):
+def chat_stream_real(user_id: str, user_input: str, history: List[Dict[str, str]], enable_search: bool = False):
     """真正的流式聊天，边推理边打字"""
     history = history or []
     # 初始状态：用户说了话，助手开始回答
@@ -48,8 +48,17 @@ def chat_stream_real(user_id: str, user_input: str, history: List[Dict[str, str]
         # 使用真正的流式响应
         from langgraph_memorey import get_streaming_response
         
+        # 开始调用之前，显示搜索状态
+        if enable_search:
+            trace_steps = [
+                "🚀 开始流式推理...",
+                "🔍 正在网上搜索相关信息...",
+                "📡 等待搜索结果..."
+            ]
+            yield history, "\n".join(trace_steps), get_formatted_memories(user_id), ""
+        
         chunk_count = 0
-        for chunk in get_streaming_response(user_id, user_input):
+        for chunk in get_streaming_response(user_id, user_input, enable_search):
             if chunk:
                 chunk_count += 1
                 accumulated_content += chunk
@@ -62,10 +71,15 @@ def chat_stream_real(user_id: str, user_input: str, history: List[Dict[str, str]
                 elapsed_time = time.time() - start_time
                 current_trace = [
                     "🚀 开始流式推理...",
+                    f"🔍 搜索功能: {'已启用' if enable_search else '已禁用'}",
                     f"⚡ 实时生成中... (耗时: {elapsed_time:.1f}s)",
                     f"📦 已收到 {chunk_count} 个chunk",
                     f"📝 当前长度: {len(accumulated_content)} 字符"
                 ]
+                
+                # 如果启用了搜索，添加搜索完成的提示
+                if enable_search and chunk_count > 1:
+                    current_trace.insert(1, "✅ 搜索完成，正在生成回答...")
                 yield history, "\n".join(current_trace), get_formatted_memories(user_id), ""
                 
                 # 添加小延迟，让用户能看到打字效果
@@ -92,6 +106,9 @@ def chat_stream_real(user_id: str, user_input: str, history: List[Dict[str, str]
 
 {final_answer}"""
                 history[-1]["content"] = display_content
+        else:
+            # 如果没有thinking标签，使用完整的累积内容作为最终回答
+            history[-1]["content"] = accumulated_content
         
         # 完成
         total_time = time.time() - start_time
@@ -232,6 +249,7 @@ with gr.Blocks(title="AI 长期记忆助理") as demo:
     
     with gr.Row():
         u_id = gr.Textbox(label="用户 ID", value="user_001", info="用于区分不同用户的记忆")
+        enable_search = gr.Checkbox(label="🔍 启用网络搜索", value=False, info="开启后可搜索最新信息")
         
     with gr.Row():
         with gr.Column(scale=3):
@@ -293,14 +311,14 @@ with gr.Blocks(title="AI 长期记忆助理") as demo:
     # 绑定发送按钮
     send_event = send_btn.click(
         chat_stream_real, 
-        inputs=[u_id, msg_in, chatbot], 
+        inputs=[u_id, msg_in, chatbot, enable_search], 
         outputs=[chatbot, trace_out, memo_out, msg_in]
     )
     
     # 绑定Enter键发送消息 - 简化版本
     msg_in.submit(
         fn=chat_stream_real,
-        inputs=[u_id, msg_in, chatbot], 
+        inputs=[u_id, msg_in, chatbot, enable_search], 
         outputs=[chatbot, trace_out, memo_out, msg_in],
         show_progress=True
     )
@@ -319,7 +337,7 @@ if __name__ == "__main__":
     try:
         demo.launch(
             server_name="0.0.0.0", 
-            server_port=8000,  # 再换个端口
+            server_port=7864,  # 使用7864端口
             share=False,
             show_error=True,
             theme=gr.themes.Soft() if hasattr(gr, 'themes') else None
