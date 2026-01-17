@@ -10,6 +10,17 @@ from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.store.sqlite import SqliteStore
 
+# 导入搜索功能
+import asyncio
+import concurrent.futures
+import time
+try:
+    from ddgs import DDGS
+    SEARCH_AVAILABLE = True
+except ImportError:
+    print("⚠️ 搜索功能不可用：请安装 ddgs 包 (pip install ddgs)")
+    SEARCH_AVAILABLE = False
+
 # --- 1. 定义状态与工具 ---
 
 class State(TypedDict):
@@ -60,6 +71,103 @@ def manage_memory(content: Any, action: Literal['upsert', 'delete'], memory_id: 
     content_str = str(content)
     return f"Memory {memory_id} {action}ed with content: {content_str}"
 
+@tool
+def web_search(queries: List[str], max_results: int = 3):
+    """
+    网络搜索工具，用于获取最新信息。
+    - queries: 搜索关键词列表，可以是多个相关的搜索词
+    - max_results: 每个查询返回的最大结果数
+    """
+    if not SEARCH_AVAILABLE:
+        return "搜索功能不可用：请安装 ddgs 包"
+    
+    def _single_search_sync(query: str):
+        """执行单个搜索查询"""
+        try:
+            print(f"🔍 搜索: {query}")
+            ddgs = DDGS()
+            time.sleep(0.5)  # 避免被限制
+            
+            results = []
+            try:
+                print(f"📡 调用DDGS API搜索: {query}")
+                search_results = ddgs.text(query, max_results=max_results)
+                print(f"📡 API返回结果类型: {type(search_results)}")
+                
+                if search_results:
+                    results = list(search_results)
+                    print(f"📡 转换为列表后的结果数量: {len(results)}")
+                    if results:
+                        print(f"📡 第一个结果: {results[0]}")
+            except Exception as e:
+                print(f"❌ 搜索 '{query}' 出错: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # 尝试英文搜索
+                if any('\u4e00' <= char <= '\u9fff' for char in query):
+                    english_query = _translate_to_english(query)
+                    print(f"🔄 尝试英文搜索: {english_query}")
+                    try:
+                        search_results = ddgs.text(english_query, max_results=max_results)
+                        if search_results:
+                            results = list(search_results)
+                            print(f"✅ 英文搜索结果数量: {len(results)}")
+                    except Exception as e2:
+                        print(f"❌ 英文搜索 '{english_query}' 出错: {e2}")
+                        import traceback
+                        traceback.print_exc()
+            
+            print(f"📊 搜索 '{query}' 最终结果数量: {len(results)}")
+            return {
+                "query": query,
+                "results": results[:max_results],
+                "count": len(results)
+            }
+        except Exception as e:
+            print(f"❌ 搜索函数内部错误: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"query": query, "error": str(e), "count": 0}
+    
+    def _translate_to_english(chinese_query: str):
+        """简单的中英文关键词映射"""
+        translations = {
+            "最新": "latest",
+            "新闻": "news", 
+            "技术": "technology",
+            "人工智能": "artificial intelligence",
+            "机器学习": "machine learning"
+        }
+        for cn, en in translations.items():
+            chinese_query = chinese_query.replace(cn, en)
+        return chinese_query
+    
+    # 执行搜索
+    all_results = []
+    for query in queries[:5]:  # 限制最多5个查询
+        result = _single_search_sync(query)
+        all_results.append(result)
+    
+    # 格式化返回结果
+    formatted_results = []
+    for result in all_results:
+        if result.get("count", 0) > 0:
+            formatted_results.append(f"搜索词: {result['query']}")
+            for i, item in enumerate(result['results'], 1):
+                title = item.get('title', 'N/A')
+                body = item.get('body', 'N/A')[:200]
+                href = item.get('href', 'N/A')
+                formatted_results.append(f"{i}. {title}")
+                formatted_results.append(f"   摘要: {body}...")
+                formatted_results.append(f"   链接: {href}")
+            formatted_results.append("")
+    
+    if not formatted_results:
+        return "未找到相关搜索结果"
+    
+    return "\n".join(formatted_results)
+
 # --- 2. 节点逻辑实现 ---
 
 # 假设你的 vLLM 服务运行在 http://localhost:8000
@@ -76,6 +184,7 @@ def call_model_stream(state: State, config: RunnableConfig):
     """简化的模型调用节点，返回完整内容"""
     # 获取用户信息
     user_id = config["configurable"].get("user_id", "default_user")
+    enable_search = config["configurable"].get("enable_search", False)
     
     # 从SQLite存储中检索长期记忆
     user_memories = {}
@@ -99,10 +208,14 @@ def call_model_stream(state: State, config: RunnableConfig):
         memories_list.append(f"- {mem_id}: {mem_data['data']}")
     info = "\n".join(memories_list)
     
+    # 构建系统提示
+    search_instruction = ""
+    
     system_prompt = f"""你是一个友好的AI助手，具备长期记忆功能。
 
     【用户记忆】：
     {info if info else "暂无记录"}
+    {search_instruction}
     
     请自然、友好地回答用户的问题。
     
@@ -118,13 +231,19 @@ def call_model_stream(state: State, config: RunnableConfig):
     
     try:
         print(f"🔍 调用模型...")
+        print(f"🔍 搜索功能: {'启用' if enable_search else '禁用'}")
         
-        # 使用普通调用，在前端实现流式效果
-        if needs_memory:
-            print("🧠 启用记忆工具...")
-            response = llm.bind_tools([manage_memory]).invoke(messages)
-        else:
-            response = llm.invoke(messages)
+        # 统一工具调用方式：根据搜索开关和记忆需求决定绑定的工具列表
+        tools_to_bind = [manage_memory]  # 始终包含记忆管理工具
+        if enable_search and SEARCH_AVAILABLE:
+            tools_to_bind.append(web_search)  # 启用搜索时添加搜索工具
+        
+        print(f"🧠 启用记忆工具...")
+        if enable_search and SEARCH_AVAILABLE:
+            print("🔍 启用搜索工具...")
+        
+        # 使用统一的工具绑定调用
+        response = llm.bind_tools(tools_to_bind).invoke(messages)
         
         print(f"🔍 模型响应完成，长度: {len(response.content) if response.content else 0}")
         return {"messages": [response]}
@@ -185,11 +304,12 @@ def call_model(state: State, config: RunnableConfig):
         user_message = state['messages'][-1].content.lower() if state['messages'] else ""
         needs_memory = any(keyword in user_message for keyword in ['我叫', '我是', '我的名字', '我住在', '我工作', '我喜欢'])
         
-        if needs_memory:
-            print("🧠 检测到可能需要记忆的信息，启用工具...")
-            response = llm.bind_tools([manage_memory]).invoke(messages)
-        else:
-            response = llm.invoke(messages)
+        # 统一工具调用方式：始终包含记忆管理工具
+        tools_to_bind = [manage_memory]  # 始终包含记忆管理工具
+        print("🧠 记忆工具已启用...")
+        
+        # 使用统一的工具绑定调用
+        response = llm.bind_tools(tools_to_bind).invoke(messages)
         
         print(f"🔍 模型响应类型: {type(response)}")
         print(f"🔍 模型响应长度: {len(response.content) if hasattr(response, 'content') and response.content else 0}")
@@ -347,8 +467,41 @@ app = workflow.compile(
     store=sqlite_store
 )
 
+# 添加一个使用LangGraph工作流的函数
+def get_langgraph_response(user_id: str, user_input: str, enable_search: bool = False):
+    """使用LangGraph工作流的响应函数，支持工具调用"""
+    config = {
+        "configurable": {
+            "user_id": user_id, 
+            "thread_id": f"thread_{user_id}",
+            "enable_search": enable_search
+        }
+    }
+    input_state = {"messages": [HumanMessage(content=user_input)]}
+    
+    try:
+        print(f"🔍 使用LangGraph工作流...")
+        print(f"🔍 搜索功能: {'启用' if enable_search else '禁用'}")
+        
+        # 使用工作流处理
+        result = app.invoke(input_state, config)
+        
+        # 获取最后的AI回复
+        if result and "messages" in result:
+            for msg in reversed(result["messages"]):
+                if hasattr(msg, 'content') and msg.content and not msg.content.startswith('[System:'):
+                    return msg.content
+        
+        return "抱歉，没有收到有效回复。"
+        
+    except Exception as e:
+        print(f"❌ LangGraph工作流失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"抱歉，处理过程中出现错误: {str(e)}"
+
 # 添加一个专门的流式处理函数
-def get_streaming_response(user_id: str, user_input: str):
+def get_streaming_response(user_id: str, user_input: str, enable_search: bool = False):
     """直接的流式响应函数，绕过LangGraph工作流"""
     # 从SQLite存储中检索长期记忆
     user_memories = {}
@@ -383,11 +536,22 @@ def get_streaming_response(user_id: str, user_input: str):
         for i, conv in enumerate(recent_history, 1):
             history_text += f"{i}. 用户: {conv['user']}\n   助手: {conv['assistant'][:100]}{'...' if len(conv['assistant']) > 100 else ''}\n"
     
+    # 构建系统提示
+    search_instruction = ""
+    if enable_search and SEARCH_AVAILABLE:
+        search_instruction = """
+    
+    【搜索功能】：
+    如果用户询问最新信息、实时数据、新闻事件或你不确定的信息，可以使用web_search工具搜索相关内容。
+    搜索时请提供相关的关键词列表。
+    """
+    
     system_prompt = f"""你是一个友好的AI助手，具备长期记忆功能。
 
     【用户记忆】：
     {info if info else "暂无记录"}
     {history_text}
+    {search_instruction}
     
     请自然、友好地回答用户的问题。参考上述记忆和对话历史，保持对话的连贯性。
     
@@ -402,18 +566,93 @@ def get_streaming_response(user_id: str, user_input: str):
     messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_input)]
     
     try:
-        print(f"🔍 开始真正的流式调用...")
+        print(f"🔍 开始处理用户请求...")
         print(f"📚 引用了 {len(recent_history)} 条历史对话")
+        print(f"🔍 搜索功能: {'启用' if enable_search else '禁用'}")
         
-        # 使用普通流式调用，不绑定工具以确保流畅输出
-        stream = llm.stream(messages)
+        # 实现智能搜索决策：让大模型自己决定是否需要搜索
         
-        # 实时返回流式内容
-        full_response = ""
-        for chunk in stream:
-            if hasattr(chunk, 'content') and chunk.content:
-                full_response += chunk.content
-                yield chunk.content
+        # 为大模型绑定搜索工具，让它可以在需要时请求搜索
+        if enable_search and SEARCH_AVAILABLE:
+            print(f"🔧 绑定搜索工具，让大模型自主决定是否需要搜索")
+            llm_with_tools = llm.bind_tools([manage_memory, web_search])
+        else:
+            llm_with_tools = llm.bind_tools([manage_memory])
+        
+        # 第一次调用大模型，让它决定是否需要搜索
+        print(f"🧠 第一次调用大模型，等待决策...")
+        first_response = llm_with_tools.invoke(messages)
+        print(f"✅ 第一次调用完成，响应类型: {type(first_response)}")
+        
+        # 检查大模型是否请求了搜索工具调用
+        search_performed = False
+        final_response = first_response
+        
+        if hasattr(first_response, 'tool_calls') and first_response.tool_calls:
+            print(f"🔧 检测到工具调用: {first_response.tool_calls}")
+            
+            # 检查是否是搜索工具调用
+            for tool_call in first_response.tool_calls:
+                if tool_call["name"] == "web_search":
+                    print(f"🔍 大模型请求搜索: {tool_call['args']}")
+                    
+                    # 执行搜索
+                    try:
+                        queries = tool_call["args"].get("queries", [])
+                        max_results = tool_call["args"].get("max_results", 3)
+                        
+                        # 确保有搜索关键词
+                        if not queries:
+                            # 如果没有指定关键词，使用用户输入
+                            queries = [user_input]
+                        
+                        print(f"📡 执行搜索查询: {queries}")
+                        search_result = web_search.invoke({"queries": queries, "max_results": max_results})
+                        print(f"✅ 搜索完成，结果长度: {len(search_result)}")
+                        print(f"🔍 搜索结果: {search_result[:200]}...")
+                        
+                        # 创建工具消息，将搜索结果返回给大模型
+                        from langchain_core.messages import ToolMessage
+                        tool_message = ToolMessage(
+                            content=search_result,
+                            tool_call_id=tool_call["id"],
+                            name=tool_call["name"]
+                        )
+                        
+                        # 将工具消息添加到对话历史
+                        messages.append(first_response)
+                        messages.append(tool_message)
+                        
+                        # 第二次调用大模型，使用搜索结果生成最终回答
+                        print(f"🧠 第二次调用大模型，基于搜索结果生成回答...")
+                        final_response = llm_with_tools.invoke(messages)
+                        print(f"✅ 第二次调用完成，响应长度: {len(final_response.content) if hasattr(final_response, 'content') and final_response.content else 0}")
+                        
+                        search_performed = True
+                        break
+                    except Exception as e:
+                        print(f"❌ 搜索执行失败: {e}")
+                        import traceback
+                        traceback.print_exc()
+        
+        # 对最终响应进行流式输出
+        if hasattr(final_response, 'content') and final_response.content:
+            full_content = final_response.content
+            print(f"📤 开始流式输出大模型响应...")
+            print(f"📤 响应内容: {full_content}")
+            print(f"📤 响应长度: {len(full_content)}")
+            
+            # 模拟流式输出效果
+            for i in range(0, len(full_content), 2):
+                chunk = full_content[i:i+2]
+                # print(f"📤 Yield chunk: '{chunk}'")
+                yield chunk
+                time.sleep(0.01)  # 添加小延迟，营造打字效果
+            
+            print(f"📤 流式输出完成")
+        else:
+            print(f"⚠️  未收到有效的大模型响应")
+            yield "抱歉，我没有收到有效的回复。请稍后再试。"
         
         # 保存当前对话到历史记录
         if user_id not in conversation_history:
@@ -421,7 +660,7 @@ def get_streaming_response(user_id: str, user_input: str):
         
         conversation_history[user_id].append({
             "user": user_input,
-            "assistant": full_response
+            "assistant": full_content if 'full_content' in locals() else ""
         })
         
         # 只保留最近10次对话（用户+助手为一次）
@@ -434,7 +673,11 @@ def get_streaming_response(user_id: str, user_input: str):
         import threading
         def delayed_memory_update():
             try:
-                update_memory_from_conversation(user_id, user_input, full_response)
+                # 使用正确的变量名full_content
+                if 'full_content' in locals():
+                    update_memory_from_conversation(user_id, user_input, full_content)
+                else:
+                    print(f"⚠️  full_content变量未定义，跳过记忆更新")
             except Exception as e:
                 print(f"❌ 延迟记忆更新失败: {e}")
         
