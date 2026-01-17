@@ -72,14 +72,15 @@ def chat_stream_real(user_id: str, user_input: str, history: List[Dict[str, str]
                 time.sleep(0.02)
         
         # 处理thinking标签（在流式完成后）
-        if '<thinking>' in accumulated_content and '</thinking>' in accumulated_content:
-            thinking_start = accumulated_content.find('<thinking>')
-            thinking_end = accumulated_content.find('</thinking>')
-            thinking_content = accumulated_content[thinking_start + 10:thinking_end]
-            final_answer = accumulated_content[thinking_end + 11:].strip()
+        thinking_tags = ['<thinking>', '<思考>', '<recollection>']
+        has_thinking = any(tag in accumulated_content for tag in thinking_tags)
+        
+        if has_thinking:
+            thinking_content, final_answer = parse_thinking_content(accumulated_content)
             
-            # 重新格式化显示
-            display_content = f"""
+            if thinking_content:
+                # 重新格式化显示
+                display_content = f"""
 <details>
 <summary>🤔 思考过程 (点击展开/折叠)</summary>
 
@@ -90,15 +91,21 @@ def chat_stream_real(user_id: str, user_input: str, history: List[Dict[str, str]
 **💡 最终回答：**
 
 {final_answer}"""
-            history[-1]["content"] = display_content
+                history[-1]["content"] = display_content
         
         # 完成
         total_time = time.time() - start_time
+        
+        # 获取对话历史数量
+        from langgraph_memorey import conversation_history
+        history_count = len(conversation_history.get(user_id, []))
+        
         final_trace = [
             "🚀 开始流式推理...",
             f"✅ 生成完成，总耗时: {total_time:.2f}秒",
             f"📝 总字符数: {len(accumulated_content)}",
-            f"📦 总chunk数: {chunk_count}"
+            f"📦 总chunk数: {chunk_count}",
+            f"📚 对话历史: {history_count} 条记录"
         ]
         
         # 使用AI判断是否需要记忆更新
@@ -113,7 +120,7 @@ def chat_stream_real(user_id: str, user_input: str, history: List[Dict[str, str]
         # 等待一下让记忆更新完成，然后刷新记忆显示
         if has_memory_info:
             time.sleep(3)  # 给AI分析和记忆更新更多时间
-            final_trace[-1] = "✅ 智能记忆更新完成"
+            final_trace[-2] = "✅ 智能记忆更新完成"
             yield history, "\n".join(final_trace), get_formatted_memories(user_id), ""
         
     except Exception as e:
@@ -268,7 +275,20 @@ with gr.Blocks(title="AI 长期记忆助理") as demo:
     def clear_chat():
         return [], "", ""
     
+    # 清空对话历史功能
+    def clear_history(user_id):
+        from langgraph_memorey import conversation_history
+        if user_id in conversation_history:
+            del conversation_history[user_id]
+        return [], "", get_formatted_memories(user_id)
+    
     clear_btn.click(clear_chat, outputs=[chatbot, trace_out, msg_in])
+    
+    # 添加清空历史按钮
+    with gr.Row():
+        clear_history_btn = gr.Button("🗂️ 清空对话历史", variant="secondary", scale=1)
+    
+    clear_history_btn.click(clear_history, inputs=[u_id], outputs=[chatbot, trace_out, memo_out])
     
     # 绑定发送按钮
     send_event = send_btn.click(
