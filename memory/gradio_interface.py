@@ -228,20 +228,26 @@ with gr.Blocks(title="AI 长期记忆助理") as demo:
         
     with gr.Row():
         with gr.Column(scale=3):
-            # 使用兼容的Chatbot参数
+            # 使用原生的聊天界面组件
             chatbot = gr.Chatbot(
                 label="💬 对话历史", 
                 height=500,
                 show_label=True
             )
-            msg_in = gr.Textbox(
-                label="输入消息", 
-                placeholder="请输入您的问题或告诉我一些关于您的信息...", 
-                scale=4,
-                lines=2
-            )
+            
             with gr.Row():
-                send_btn = gr.Button("📤 发送", variant="primary", scale=1)
+                msg_in = gr.Textbox(
+                    label="输入消息", 
+                    placeholder="请输入您的问题或告诉我一些关于您的信息... (按Enter发送)", 
+                    scale=4,
+                    lines=1,
+                    interactive=True,
+                    show_label=False,
+                    container=False
+                )
+                send_btn = gr.Button("📤 发送", variant="primary", scale=1, size="sm")
+            
+            with gr.Row():
                 clear_btn = gr.Button("🗑️ 清空对话", variant="secondary", scale=1)
         
         with gr.Column(scale=2):
@@ -264,9 +270,22 @@ with gr.Blocks(title="AI 长期记忆助理") as demo:
     
     clear_btn.click(clear_chat, outputs=[chatbot, trace_out, msg_in])
     
-    send_btn.click(chat_stream_real, [u_id, msg_in, chatbot], [chatbot, trace_out, memo_out, msg_in])
-    msg_in.submit(chat_stream_real, [u_id, msg_in, chatbot], [chatbot, trace_out, memo_out, msg_in])
-    demo.load(get_formatted_memories, [u_id], [memo_out])
+    # 绑定发送按钮
+    send_event = send_btn.click(
+        chat_stream_real, 
+        inputs=[u_id, msg_in, chatbot], 
+        outputs=[chatbot, trace_out, memo_out, msg_in]
+    )
+    
+    # 绑定Enter键发送消息 - 简化版本
+    msg_in.submit(
+        fn=chat_stream_real,
+        inputs=[u_id, msg_in, chatbot], 
+        outputs=[chatbot, trace_out, memo_out, msg_in],
+        show_progress=True
+    )
+    
+    demo.load(get_formatted_memories, inputs=[u_id], outputs=[memo_out])
 
 if __name__ == "__main__":
     print("🚀 启动 AI 长期记忆助理...")
@@ -280,7 +299,7 @@ if __name__ == "__main__":
     try:
         demo.launch(
             server_name="0.0.0.0", 
-            server_port=7864,  # 再换个端口
+            server_port=8000,  # 再换个端口
             share=False,
             show_error=True,
             theme=gr.themes.Soft() if hasattr(gr, 'themes') else None
