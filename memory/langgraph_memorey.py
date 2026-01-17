@@ -1,6 +1,6 @@
 # conda activate unimernet
 import sqlite3
-from typing import Annotated, TypedDict, Literal, Dict, Optional, Any
+from typing import Annotated, TypedDict, Literal, Dict, Optional, Any, List
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, RemoveMessage, ToolMessage
 from langchain_core.tools import tool
@@ -43,6 +43,9 @@ except sqlite3.Error as e:
 
 # 内存缓存，用于提高性能
 memory_cache: Dict[str, Dict[str, Dict[str, str]]] = {}
+
+# 对话历史缓存，存储每个用户的最近对话
+conversation_history: Dict[str, List[Dict[str, str]]] = {}
 
 @tool
 def manage_memory(content: Any, action: Literal['upsert', 'delete'], memory_id: str):
@@ -369,14 +372,30 @@ def get_streaming_response(user_id: str, user_input: str):
         memories_list.append(f"- {mem_id}: {mem_data['data']}")
     info = "\n".join(memories_list)
     
+    # 获取用户的对话历史（最近5次）
+    user_history = conversation_history.get(user_id, [])
+    recent_history = user_history[-5:] if len(user_history) > 5 else user_history
+    
+    # 构建历史对话文本
+    history_text = ""
+    if recent_history:
+        history_text = "\n【最近对话历史】：\n"
+        for i, conv in enumerate(recent_history, 1):
+            history_text += f"{i}. 用户: {conv['user']}\n   助手: {conv['assistant'][:100]}{'...' if len(conv['assistant']) > 100 else ''}\n"
+    
     system_prompt = f"""你是一个友好的AI助手，具备长期记忆功能。
 
     【用户记忆】：
     {info if info else "暂无记录"}
+    {history_text}
     
-    请自然、友好地回答用户的问题。
+    请自然、友好地回答用户的问题。参考上述记忆和对话历史，保持对话的连贯性。
     
-    对于复杂问题，请在回答开头用 <thinking>思考过程</thinking> 来展示推理过程，然后给出最终回答。
+    对于复杂问题，你可以在回答开头展示思考过程，然后给出最终回答。
+    思考过程可以用以下任一标签包围：
+    - <thinking>思考过程</thinking>
+    - <思考>思考过程</思考>
+    - <recollection>思考过程</recollection>
     """
     
     from langchain_core.messages import SystemMessage, HumanMessage
@@ -384,6 +403,7 @@ def get_streaming_response(user_id: str, user_input: str):
     
     try:
         print(f"🔍 开始真正的流式调用...")
+        print(f"📚 引用了 {len(recent_history)} 条历史对话")
         
         # 使用普通流式调用，不绑定工具以确保流畅输出
         stream = llm.stream(messages)
@@ -394,6 +414,21 @@ def get_streaming_response(user_id: str, user_input: str):
             if hasattr(chunk, 'content') and chunk.content:
                 full_response += chunk.content
                 yield chunk.content
+        
+        # 保存当前对话到历史记录
+        if user_id not in conversation_history:
+            conversation_history[user_id] = []
+        
+        conversation_history[user_id].append({
+            "user": user_input,
+            "assistant": full_response
+        })
+        
+        # 只保留最近10次对话（用户+助手为一次）
+        if len(conversation_history[user_id]) > 10:
+            conversation_history[user_id] = conversation_history[user_id][-10:]
+        
+        print(f"💾 已保存对话历史，当前总数: {len(conversation_history[user_id])}")
         
         # 流式输出完成后，异步处理记忆更新
         import threading
@@ -569,23 +604,32 @@ def stream_with_timeout(input_state, config, timeout_seconds=20):
 def parse_thinking_content(content):
     """
     解析思考内容，分离思考过程和最终回答
+    支持多种思考标签：<thinking>、<思考>、<recollection>
     """
     if not content:
         return "", ""
     
-    # 查找 <thinking> 标签
-    thinking_start = content.find('<thinking>')
-    thinking_end = content.find('</thinking>')
+    # 定义支持的思考标签对
+    thinking_tags = [
+        ('<thinking>', '</thinking>'),
+        ('<思考>', '</思考>'),
+        ('<recollection>', '</recollection>')
+    ]
     
-    if thinking_start != -1 and thinking_end != -1:
-        # 提取思考过程
-        thinking_content = content[thinking_start + 10:thinking_end].strip()
-        # 提取最终回答
-        final_answer = content[thinking_end + 11:].strip()
-        return thinking_content, final_answer
-    else:
-        # 如果没有思考标签，整个内容作为最终回答
-        return "", content
+    # 尝试找到任何一种思考标签
+    for start_tag, end_tag in thinking_tags:
+        thinking_start = content.find(start_tag)
+        thinking_end = content.find(end_tag)
+        
+        if thinking_start != -1 and thinking_end != -1:
+            # 提取思考过程
+            thinking_content = content[thinking_start + len(start_tag):thinking_end].strip()
+            # 提取最终回答
+            final_answer = content[thinking_end + len(end_tag):].strip()
+            return thinking_content, final_answer
+    
+    # 如果没有找到任何思考标签，整个内容作为最终回答
+    return "", content
 
 # 添加退出处理函数，确保数据库连接被正确关闭
 import atexit
