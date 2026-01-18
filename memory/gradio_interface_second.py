@@ -35,67 +35,73 @@ def chat_stream_real(user_id: str, user_input: str, history: list, enable_search
     }
     
     yield history, "\n".join(trace_steps), get_formatted_memories(user_id), ""
+    
+    # 跟踪累积的助手回答
+    accumulated_content = ""
 
     try:
-        # 使用推荐的 stream 方法监听节点
-        for event in app.stream({"messages": [HumanMessage(content=user_input)]}, config, stream_mode="updates"):
-            for node_name, output in event.items():
-                trace_steps.append(f"📍 节点完成: {node_name}")
-                
-                # 首先检查是否有消息输出
-                if "messages" in output and output["messages"]:
-                    msg = output["messages"][-1]
+        # 1. 使用 stream_mode="messages" 获取真正的 Token 级流式输出
+        for msg, metadata in app.stream(
+            {"messages": [HumanMessage(content=user_input)]}, 
+            config, 
+            stream_mode="messages"  # 关键改动：切换到 messages 模式
+        ):
+            # 2. 从 metadata 中获取节点信息（用于追踪执行轨迹）
+            node_name = metadata.get("langgraph_node")
+            if node_name and f"📍 节点: {node_name}" not in trace_steps:
+                trace_steps.append(f"📍 节点: {node_name}")
+                yield history, "\n".join(trace_steps), get_formatted_memories(user_id), ""
+            
+            # 3. 处理工具调用（agent决定调用工具时）
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tool_name = tc['name']
+                    tool_args = tc['args']
+                    trace_steps.append(f"🔧 触发工具: {tool_name}")
                     
-                    # 如果是工具调用（这表示agent决定调用工具，工具还没执行），立即给用户反馈
-                    if hasattr(msg, "tool_calls") and msg.tool_calls:
-                        for tc in msg.tool_calls:
-                            tool_name = tc['name']
-                            tool_args = tc['args']
-                            trace_steps.append(f"🔧 触发工具: {tool_name}")
-                            
-                            # 显示工具参数详情
-                            if tool_args:
-                                args_str = ", ".join([f"{k}={v}" for k, v in tool_args.items()])
-                                trace_steps.append(f"   📋 参数: {args_str}")
-                            
-                            # 如果是网络搜索，立即给用户显示开始搜索的反馈
-                            if tool_name == "web_search":
-                                # 显示具体的搜索关键词
-                                search_queries = tool_args.get("queries", [])
-                                if search_queries:
-                                    query_str = ", ".join(search_queries)
-                                    history[-1]["content"] = f"🔧 开始网络搜索: {query_str}..."
-                                else:
-                                    history[-1]["content"] = "🔧 开始网络搜索相关信息..."
-                                # 立即返回反馈给用户
-                                yield history, "\n".join(trace_steps), get_formatted_memories(user_id), ""
+                    # 显示工具参数详情
+                    if tool_args:
+                        args_str = ", ".join([f"{k}={v}" for k, v in tool_args.items()])
+                        trace_steps.append(f"   📋 参数: {args_str}")
                     
-                    # 如果是模型回答，则流式显示文字
-                    elif isinstance(msg, AIMessage) and msg.content:
-                        full_content = msg.content
-                        current_text = ""
-                        for char in full_content:
-                            current_text += char
-                            history[-1]["content"] = current_text
-                            yield history, "\n".join(trace_steps), get_formatted_memories(user_id), ""
-                            time.sleep(0.01)
-                    # 如果是工具执行结果，显示执行结果
-                    elif isinstance(msg, ToolMessage) and msg.content:
-                        tool_name = msg.name
-                        trace_steps.append(f"✅ 工具 '{tool_name}' 执行完成")
-                        
-                        # 如果是网络搜索结果，给用户显示搜索完成
-                        if tool_name == "web_search":
-                            history[-1]["content"] = "📊 搜索完成，正在生成回答..."
-                        
-                        # 在轨迹中显示工具返回的简要信息
-                        if len(msg.content) > 100:
-                            brief_result = msg.content[:100] + "..."
-                            trace_steps.append(f"   📤 结果(简要): {brief_result}")
+                    # 如果是网络搜索，立即给用户显示开始搜索的反馈
+                    if tool_name == "web_search":
+                        # 显示具体的搜索关键词
+                        search_queries = tool_args.get("queries", [])
+                        if search_queries:
+                            query_str = ", ".join(search_queries)
+                            history[-1]["content"] = f"🔧 开始网络搜索: {query_str}..."
                         else:
-                            trace_steps.append(f"   📤 结果: {msg.content}")
+                            history[-1]["content"] = "🔧 开始网络搜索相关信息..."
+                        # 立即返回反馈给用户
+                        yield history, "\n".join(trace_steps), get_formatted_memories(user_id), ""
+            
+            # 4. 处理工具执行结果
+            elif isinstance(msg, ToolMessage) and msg.content:
+                tool_name = msg.name
+                trace_steps.append(f"✅ 工具 '{tool_name}' 执行完成")
+                
+                # 如果是网络搜索结果，给用户显示搜索完成
+                if tool_name == "web_search":
+                    history[-1]["content"] = "📊 搜索完成，正在生成回答..."
+                
+                # 在轨迹中显示工具返回的简要信息
+                if len(msg.content) > 100:
+                    brief_result = msg.content[:100] + "..."
+                    trace_steps.append(f"   📤 结果(简要): {brief_result}")
+                else:
+                    trace_steps.append(f"   📤 结果: {msg.content}")
                 
                 yield history, "\n".join(trace_steps), get_formatted_memories(user_id), ""
+            
+            # 5. 处理模型回答的实时 Token（真正的流式输出）
+            elif isinstance(msg, AIMessage) and msg.content:
+                # 过滤掉工具调用产生的消息（避免乱码）
+                if not hasattr(msg, "tool_calls") or not msg.tool_calls:
+                    # 使用自己的累积变量来确保正确追加
+                    accumulated_content += msg.content
+                    history[-1]["content"] = accumulated_content
+                    yield history, "\n".join(trace_steps), get_formatted_memories(user_id), ""
 
         # 最终处理思考内容折叠
         thinking, final_ans = parse_thinking_content(history[-1]["content"])
